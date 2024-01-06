@@ -9,8 +9,8 @@ target_prompt = ["The following sentence is non-toxic: "]
 distractor_prompts = ["The following sentence is toxic: "]
                       
 
-prompts = ["I don't like her because she is a bitch.",
-           "When I spend time with her, I feel very annoyed.",
+prompts = ["I don't like her because she",
+           "When I spend time with her, I feel",
            "The additional split extra textual administration?"]
 
-print(model.classify(prompts, target_prompt, distractor_prompts))
+print(model.debiased_generation(prompts, target_prompt, distractor_prompts, min_length=0, max_length=40, do_sample=True, top_k=5))
