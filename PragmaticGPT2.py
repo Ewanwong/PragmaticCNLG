@@ -183,6 +183,20 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             output_ids = output_ids[:(output_ids.shape[0]//(self.num_classes+1)), ...]
         return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
     
+    def compute_perplexity(self, input_texts, target_prompts, distractor_prompts):
+        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts)
+        outputs, step_output= self.pragmatic_modeling(**inputs, labels=labels)
+        regular_loss = outputs.loss
+        real_labels = inputs[:(inputs.input_ids.shape[0]//(self.num_classes+1)), ...].clone()
+        lm_logits = step_output.pragmatic_speaker_probabilities
+
+        loss_fct = CrossEntropyLoss()
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = real_labels[..., 1:].contiguous()
+   
+        debiased_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        return regular_loss, debiased_loss
+
     # rewrite sample function from GenerationMixin
     def sample(
         self,
