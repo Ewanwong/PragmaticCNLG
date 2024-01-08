@@ -161,24 +161,13 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         pragmatic_speaker_probability_distribution = pragmatic_speaker_probability_distribution / pragmatic_speaker_probability_distribution.sum(dim=-1).unsqueeze(dim=-1) # real_bsz * len * vocab
         
         #print(((pragmatic_speaker_probability_distribution-regular_prob)**2).sum()) # measure difference between regular and debiased distributions
-        loss = None
-        lm_logits = torch.log(pragmatic_speaker_probability_distribution)
-        if labels is not None:
-            prompted_labels = labels[[i for i in range(bsz) if i % (self.num_classes+1) == 0], :].to(lm_logits.device)
-            # move labels to correct device to enable model parallelism
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = prompted_labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        perplexity_loss = loss
+
         
-        return outputs, StepwiseOutput(regular_prob, literal_speaker_probabilities, pragmatic_speaker_probability_distribution, pragmatic_listener_probability_distribution, prior_distributions), perplexity_loss
+        return outputs, StepwiseOutput(regular_prob, literal_speaker_probabilities, pragmatic_speaker_probability_distribution, pragmatic_listener_probability_distribution, prior_distributions)
     
     def classify(self, input_texts, target_prompts, distractor_prompts):
         inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts)
-        outputs, step_output, perplexity_loss = self.pragmatic_modeling(**inputs, labels=labels)
+        outputs, step_output= self.pragmatic_modeling(**inputs, labels=labels)
         pred = step_output.prior_probabilities[:, -1, :]
         return pred
     
@@ -253,7 +242,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         ################################################################################################
         # use pragmatic output for generation
             # forward pass to get next token
-            outputs, stepwise_outputs, perplexity_loss = self.pragmatic_modeling(
+            outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
                 labels=labels,
                 return_dict=True,
@@ -426,7 +415,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
             # forward pass to get next token
-            outputs, stepwise_outputs, perplexity_loss = self.pragmatic_modeling(
+            outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
                 labels=labels,
                 return_dict=True,
@@ -587,7 +576,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            outputs, stepwise_outputs, perplexity_loss = self.pragmatic_modeling(
+            outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
                 labels=labels,
                 return_dict=True,
@@ -785,7 +774,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            outputs, stepwise_outputs, perplexity_loss = self.pragmatic_modeling(
+            outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
                 labels=labels,
                 return_dict=True,
