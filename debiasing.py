@@ -8,20 +8,20 @@ from transformers import AutoConfig
 import torch
 from tqdm import tqdm
 from PragmaticGPT2 import PragmaticGPT2LMHeadModel
-
+from transformers import AutoTokenizer
 from perspective_api import PerspectiveApiScorer
 from io_utils import load_prompts, ModelOutput, Prompt
 
 TARGET_PREFIXES = [
-    "The following text contains no toxic content:"
+    "The following text contains no bias, stereotypes, hateful speech or toxic content:"
 ]
 DISTRACTOR_PREFIXES = [
-    "The following text contains rude, disrespectful, or unreasonable language:\n",
-    "The following text contains very hateful, aggressive, disrespectful language:\n",
-    "The following text contains sexually explicit language:\n",
-    "The following text contains a threat:\n",
-    "The following text contains negative or hateful language targeting someone because of their identity:\n",
-    "The following text contains swear words, curse words, or other obscene or profane language:\n"
+    "The following text contains rude, disrespectful, or unreasonable language:",
+    "The following text contains very hateful, aggressive, disrespectful language:",
+    "The following text contains sexually explicit language:",
+    "The following text contains a threat:",
+    "The following text contains negative or hateful language targeting someone because of their identity:",
+    "The following text contains swear words, curse words, or other obscene or profane language:"
 ]
 
 
@@ -69,7 +69,7 @@ if __name__ == '__main__':
                         help="API Key for Perspective API, see https://support.perspectiveapi.com/s/docs-get-started")
     parser.add_argument("--models", type=str, nargs='+', default=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
                         help="The specific models to run self-debiasing experiments for (e.g., 'gpt2-medium gpt2-large')")
-    parser.add_argument("--modes", nargs='+', choices=['default', 'debiased'], default=['default', 'debiased'],
+    parser.add_argument("--modes", nargs='+', choices=['default', 'debiased'], default=['debiased'],
                         help="Whether to perform debiased ('debiased') or regular ('default') generation")
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Value for the rational parameter")
@@ -87,7 +87,7 @@ if __name__ == '__main__':
                         help="Maximum length for the generated text")
     parser.add_argument("--top_k", type=int, default=5,
                         help="Only for sampling. If set, only the top_k tokens with the highest probabilities are considered.")
-    parser.add_argument("--num_beams", type=int, default=3,
+    parser.add_argument("--num_beams", type=int, default=1,
                         help="The number of beams for beam search")
     parser.add_argument("--num_return_sequences", type=int, default=1,
                         help="The number of sequences to return for each prompt")
@@ -121,24 +121,42 @@ if __name__ == '__main__':
         prompts = prompts[:args.max_prompts]
 
     for model_idx, model_name in enumerate(args.models):
-        config = AutoConfig.from_pretrained(model_name)
-        model = PragmaticGPT2LMHeadModel(config, args.alpha, 0, len(TARGET_PREFIXES)+len(DISTRACTOR_PREFIXES))
+        
+        model = PragmaticGPT2LMHeadModel(model_name ,args.alpha, 0, len(TARGET_PREFIXES)+len(DISTRACTOR_PREFIXES))
 
-
+        errors = 0
         for mode in args.modes:
             
-            
+            if mode == "default":
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                tokenizer.padding_side = 'left'
+                tokenizer.pad_token = tokenizer.eos_token
             print(f'Generating continuations for {len(prompts)} prompts with model {model_name} ({mode})')
             prompt_iterator = tqdm(prompts, desc="Prompts")
+            
             for prompt in prompt_iterator:
                 output_texts = []
                 for _ in range(args.num_repeats):
                     if mode == 'debiased':
-                        output_texts += model.debiased_generation([prompt.text],target_prompts=TARGET_PREFIXES, distractor_prompts=DISTRACTOR_PREFIXES, min_length=args.min_length, max_length=args.max_length, do_sample=args.do_sample,
-                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)
+                        try:
+                            output_texts += model.debiased_generation([prompt.text],target_prompts=TARGET_PREFIXES, distractor_prompts=DISTRACTOR_PREFIXES, min_length=args.min_length, max_length=args.max_length, do_sample=args.do_sample,
+                                num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)
+                        except RuntimeError:
+                            inputs = model.tokenizer_left([prompt.text], padding=True, truncation=True, return_tensors='pt')
+                            inputs = {k:v.to(model.device) for k,v in inputs.items()}
+                            min_length = inputs['input_ids'].shape[1] + args.min_length
+                            max_length = inputs['input_ids'].shape[1] + args.max_length
+                            output_texts += model.tokenizer_left.batch_decode(model.model.generate(**inputs, min_length=min_length, max_length=max_length, do_sample=args.do_sample,
+                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+                            print("new error")
                     elif mode == 'default':
-                        output_texts += model.generate([prompt.text], min_length=args.min_length, max_length=args.max_length, do_sample=args.do_sample,
-                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)
+                        
+                        inputs = tokenizer([prompt.text], padding=True, truncation=True, return_tensors='pt')
+                        inputs = {k:v.to(model.device) for k,v in inputs.items()}
+                        min_length = inputs['input_ids'].shape[1] + args.min_length
+                        max_length = inputs['input_ids'].shape[1] + args.max_length
+                        output_texts += tokenizer.batch_decode(model.model.generate(**inputs, min_length=min_length, max_length=max_length, do_sample=args.do_sample,
+                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
 
                 # clear prompt continuations from previous iterations
                 prompt.continuations.clear()
@@ -147,7 +165,7 @@ if __name__ == '__main__':
                     scores = scorer.get_scores(output_text)
                     generated_example = ModelOutput(text=output_text, scores=scores)
                     prompt.continuations.append(generated_example)
-                    
+                   
             maximum_expected_scores = get_maximum_expected_score_per_attribute(prompts)
             attribute_probabilities = get_attribute_probabilities(prompts)
 

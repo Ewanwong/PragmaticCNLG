@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
-from transformers import GPT2LMHeadModel, LogitsProcessorList, LogitsProcessor, PreTrainedTokenizer, GPT2Tokenizer
+from transformers import GPT2LMHeadModel, LogitsProcessorList, LogitsProcessor, PreTrainedTokenizer, AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.generation_utils import GenerationMixin, SampleEncoderDecoderOutput, SampleDecoderOnlyOutput, GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput, BeamSampleEncoderDecoderOutput, BeamSampleDecoderOnlyOutput, BeamSearchEncoderDecoderOutput, BeamSearchDecoderOnlyOutput
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from transformers.generation_beam_search import BeamScorer, BeamSearchScorer, BeamHypotheses
@@ -22,26 +22,30 @@ class StepwiseOutput:
         self.prior_probabilities = prior_probabilities # bsz * len * num_class: first step uniform
         #self.prior_probabilities_next_step = prior_probabilities_next_step  # bsz * num_class * vocab 
 
-class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
-    def __init__(self, model, config, alpha, epsilon, num_classes):
-        super().__init__(config)
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        #self._device = torch.device("cpu")
-        self.model = GPT2LMHeadModel.from_pretrained(model).to(self._device)
+class PragmaticGPT2LMHeadModel(GenerationMixin):
+    def __init__(self, model, alpha, epsilon, num_classes):
+        self.config = AutoConfig.from_pretrained(model)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #self.device = torch.device("cpu")
+        self.model = AutoModelForCausalLM.from_pretrained(model).to(self.device)
 
         self.model.eval()
         torch.set_grad_enabled(False)
-        
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model)
-        self.tokenizer.padding_side = 'left'
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        # left padding for generation
+        self.tokenizer_left = AutoTokenizer.from_pretrained(model)
+        self.tokenizer_left.padding_side = 'left'
+        self.tokenizer_left.pad_token = self.tokenizer_left.eos_token
+        # right padding for calculating sentence probabilities
+        self.tokenizer_right = AutoTokenizer.from_pretrained(model)
+        self.tokenizer_right.pad_token = self.tokenizer_right.eos_token
+
         self.alpha = alpha
         self.epsilon = epsilon
         self.num_classes = num_classes
         print('model initialized')
         
 
-    def prepare_target_distractor_inputs(self, input_texts, target_prompts, distractor_prompts):
+    def prepare_target_distractor_inputs(self, input_texts, target_prompts, distractor_prompts, padding_side):
         """
         input_texts: a list of strings
         target_prompts: a list of prompts that encourage models to produce attributes of interest
@@ -56,43 +60,55 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         for distractor_prompt in distractor_prompts:
             for input_text in input_texts:         
                 inputs += [distractor_prompt + input_text]
-
-        inputs = self.tokenizer(inputs, padding=True, truncation=True, return_tensors='pt')
-        inputs = {k:v.to(self._device) for k,v in inputs.items()}
+        if padding_side == 'left':
+            inputs = self.tokenizer_left(inputs, padding=True, truncation=True, return_tensors='pt')
+        elif padding_side == 'right':
+            inputs = self.tokenizer_right(inputs, padding=True, truncation=True, return_tensors='pt')
+        else:
+            raise ValueError("Padding direction must be provided: left or right")
+        
+        inputs = {k:v.to(self.device) for k,v in inputs.items()}
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         labels = input_ids.clone()
         
-        # mask out prompts, only calculate the loss for inputs
-        input_lengths = attention_mask[:input_ids.shape[0]//(self.num_classes+1),:].sum(dim=1).cpu()
+        input_lengths = attention_mask.sum(dim=1).cpu()
+        real_input_lengths = attention_mask[:input_ids.shape[0]//(self.num_classes+1),:].sum(dim=1).repeat(self.num_classes+1).cpu()
         
         length_mask = torch.zeros(size=attention_mask.shape)
-        for i in range(len(input_texts)):
-            length_mask[[i+k*(len(input_texts)) for k in range(self.num_classes+1)], -input_lengths[i].item():] = 1
-        length_mask = length_mask.to(self._device)
+        if padding_side == 'left':
+            for i in range(input_lengths.shape[0]):
+                length_mask[i, -real_input_lengths[i]:] = 1
+        if padding_side == 'right':
+            for i in range(input_lengths.shape[0]):
+                length_mask[i, input_lengths[i]-real_input_lengths[i]:input_lengths[i]] = 1
+            
+        length_mask = length_mask.to(self.device)
         labels.masked_fill_(length_mask == 0, -100)
         #print("inputs prepared")
         
         return inputs, labels
     
-    def pragmatic_modeling(self,
-        input_ids: Optional[torch.LongTensor] = None, # contains regular+target+distractors
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+    def compute_prior_distributions(self, 
+                                        input_ids: Optional[torch.LongTensor] = None, # contains regular+target+distractors
+                                        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+                                        attention_mask: Optional[torch.FloatTensor] = None,
+                                        token_type_ids: Optional[torch.LongTensor] = None,
+                                        position_ids: Optional[torch.LongTensor] = None,
+                                        head_mask: Optional[torch.FloatTensor] = None,
+                                        inputs_embeds: Optional[torch.FloatTensor] = None,
+                                        encoder_hidden_states: Optional[torch.Tensor] = None,
+                                        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+                                        labels: Optional[torch.LongTensor] = None,
+                                        use_cache: Optional[bool] = None,
+                                        output_attentions: Optional[bool] = None,
+                                        output_hidden_states: Optional[bool] = None,
+                                        return_dict: Optional[bool] = None,
+
+
+                                    ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         
-    ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
-        
+        # inputs must be padded from right
         outputs = self.model(input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -108,16 +124,13 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        # logits, past_key_values, hidden_states, attentions
         logits = outputs.logits # batch, length, vocab
-        prob = logits.softmax(dim=-1)
+        
+        
+
         bsz = logits.shape[0]
         real_bsz = bsz // (self.num_classes+1)
-        #print(bsz, real_bsz)
-        # calculate prior probabilities
-        # print(logits.shape)
-
-
+        # calculate normalized probabilities distribution
         loss_fct = CrossEntropyLoss(reduction='none')
         lm_logits = outputs.logits[real_bsz:, ...]
         if labels is not None:
@@ -129,15 +142,81 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             # Flatten the tokens
             
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        loss_by_sequence = loss.view(lm_logits.size(0), -1).cumsum(dim=1) # bsz * len
+
+        loss_by_sequence = loss.view(lm_logits.size(0), -1) # bsz * len-1
+
+        real_loss_mask = (loss_by_sequence!=0.000) # where the real inputs lie, bsz * len
+        real_loss_length = real_loss_mask.sum(dim=1) #bsz,
+
+        left_padded_loss_by_sequence = torch.zeros(loss_by_sequence.shape[0], loss_by_sequence.shape[1])
+        for i in range(left_padded_loss_by_sequence.shape[0]):
+            #print(real_loss_length[i], real_loss_mask[i, :].sum())
+            left_padded_loss_by_sequence[i, -real_loss_length[i]:] = loss_by_sequence[i, real_loss_mask[i, :]]
         
-        unnormalized_listener_probability = loss_by_sequence.view(real_bsz, self.num_classes, loss_by_sequence.shape[1]).permute(0, 2, 1) # real_bsz * len * num_classes
+        left_padded_loss_by_sequence = left_padded_loss_by_sequence.cumsum(dim=1)
+        length_mask = torch.ones((loss_by_sequence.shape[0], loss_by_sequence.shape[1]))
+        for i in range(real_loss_length.shape[0]):
+            length_mask[i,-real_loss_length[i]:] = torch.tensor([j+1 for j in range(real_loss_length[i])])
+        length_mask = length_mask.to(self.device) 
+        loss_by_sequence /= length_mask
+        #print((loss_by_sequence==0.000).sum(dim=1)[0]) # real_bsz, 
+        #loss_by_sequence /= torch.tensor([i+1 for i in range(loss_by_sequence.shape[1])]*loss_by_sequence.shape[0], device=loss_by_sequence.device)
+        unnormalized_listener_probability = loss_by_sequence.view(self.num_classes, real_bsz, loss_by_sequence.shape[1]).permute(1, 2, 0) # real_bsz * len-1 * num_classes
         
-        prior_distributions = F.softmax(unnormalized_listener_probability, dim=-1) # real_bsz * len-1 * num_classes
-        prior_distributions = torch.cat(((torch.ones((real_bsz, 1, self.num_classes))/self.num_classes).to(self._device), prior_distributions), dim=1)
+        prior_distributions = F.softmax(-unnormalized_listener_probability, dim=-1) # real_bsz * len-1 * num_classes
+        prior_distributions = torch.cat(((torch.ones((real_bsz, 1, self.num_classes))/self.num_classes).to(self.device), prior_distributions), dim=1)
         #print(prior_distributions)
+        return prior_distributions
+
+
+    def pragmatic_modeling(self,
+        input_ids: Optional[torch.LongTensor] = None, # contains regular+target+distractors
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        #labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         
+        prior_distributions=None,
+    ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         
+        if prior_distributions is None:
+            raise ValueError("Missing prior_distributions, please compute the prior distributions using 'compute_prior_distributions' with right padded inputs")
+        
+        outputs = self.model(input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            #labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        
+        # logits, past_key_values, hidden_states, attentions
+        logits = outputs.logits # batch, length, vocab
+        prob = logits.softmax(dim=-1)
+        bsz = logits.shape[0]
+        real_bsz = bsz // (self.num_classes+1)
+        #print(bsz, real_bsz)
+        # calculate prior probabilities
+        # print(logits.shape)
+
+
         
         regular_prob = prob[:real_bsz,:,:] # real_bsz * len * vocab
         other_prob = prob[real_bsz:,:,:] # real_bsz x num_classes, len, vocab
@@ -166,42 +245,91 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         return outputs, StepwiseOutput(regular_prob, literal_speaker_probabilities, pragmatic_speaker_probability_distribution, pragmatic_listener_probability_distribution, prior_distributions)
     
     def classify(self, input_texts, target_prompts, distractor_prompts):
-        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts)
-        outputs, step_output= self.pragmatic_modeling(**inputs, labels=labels)
-        pred = step_output.prior_probabilities[:, -1, :]
+        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts, padding_side='right')
+        prior_distributions = self.compute_prior_distributions(**inputs, labels=labels)
+        pred = prior_distributions[:, -1, :]
         return pred
     
     def debiased_generation(self, input_texts, target_prompts, distractor_prompts, min_length: int = None, max_length: int = None, **kwargs):
-        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts)
+        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts, padding_side='right')
+        prior_distributions = self.compute_prior_distributions(**inputs, labels=labels)
+        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts, padding_side='left')
         input_length = inputs['input_ids'].shape[1]
         if min_length is not None:
             min_length = min_length + input_length
         if max_length is not None:
             max_length = max_length + input_length
-        output_ids = self.generate(**inputs, labels=labels, min_length=min_length, max_length=max_length, **kwargs)
+        output_ids = self.generate(**inputs, labels=labels, min_length=min_length, max_length=max_length, prior_distributions=prior_distributions, use_cache=False, **kwargs)
         if output_ids.shape[0] == inputs['input_ids'].shape[0]: # beam search returns real batch size
             output_ids = output_ids[:(output_ids.shape[0]//(self.num_classes+1)), ...]
-        return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        return self.tokenizer_left.batch_decode(output_ids[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
     
     def compute_perplexity(self, input_texts, target_prompts, distractor_prompts):
-        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts)
-        outputs, step_output= self.pragmatic_modeling(**inputs, labels=labels)
-        regular_loss = outputs.loss
-        real_labels = inputs[:(inputs.input_ids.shape[0]//(self.num_classes+1)), ...].clone()
-        lm_logits = step_output.pragmatic_speaker_probabilities
+        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts, padding_side='right')
+        prior_distributions = self.compute_prior_distributions(**inputs, labels=labels)
+        inputs, labels = self.prepare_target_distractor_inputs(input_texts, target_prompts, distractor_prompts, padding_side='left')
+        outputs, step_output= self.pragmatic_modeling(**inputs, prior_distributions=prior_distributions)
 
+        debiased_output_logits = torch.log(step_output.pragmatic_speaker_probabilities)
+        regular_output_logits = outputs.logits[:(inputs['input_ids'].shape[0]//(self.num_classes+1)), ...]
+        real_labels = labels[:(inputs['input_ids'].shape[0]//(self.num_classes+1)), ...]
+
+        assert real_labels.shape[0] == 1, "no batch computation for perplexity"
+        label_mask = (real_labels!=100)
+        regular_output_logits=regular_output_logits[label_mask].unsqueeze(0)
+        debiased_output_logits=debiased_output_logits[label_mask].unsqueeze(0)
+        real_labels = real_labels[label_mask].unsqueeze(0)
+        print(regular_output_logits.shape, debiased_output_logits.shape, real_labels.shape)
         loss_fct = CrossEntropyLoss()
-        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_regular_logits = regular_output_logits[..., :-1, :].contiguous()
+        shift_debiased_logits = debiased_output_logits[..., :-1, :].contiguous()
         shift_labels = real_labels[..., 1:].contiguous()
    
-        debiased_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        regular_loss = loss_fct(shift_regular_logits.view(-1, shift_regular_logits.size(-1)), shift_labels.view(-1))
+        debiased_loss = loss_fct(shift_debiased_logits.view(-1, shift_debiased_logits.size(-1)), shift_labels.view(-1))
+
         return regular_loss, debiased_loss
 
-    # rewrite sample function from GenerationMixin
+ 
+    def update_prior_distributions(self, input_ids, pragmatic_listener_probabilities, prior_distributions):
+        # input_ids: bsz * len+1
+        # pragmatic_listener_probabilities: real_bsz * len+1 * num_classes * vocab
+        # prior_distributions: real_bsz * len * num_classes
+        real_bsz, cur_len, num_classes, vocab = pragmatic_listener_probabilities.shape
+        assert num_classes == self.num_classes
+        next_token_selection = input_ids[:, -1] # bsz,
+        
+        # assert torch.cat([next_token_selection[:input_ids.shape[0]//(self.num_classes+1)]]*(self.num_classes+1)) == next_token_selection # make sure for each prompt, a same continuation is selected
+        next_token_pragmatic_listener_probabilities = pragmatic_listener_probabilities.permute(2, 0, 1, 3).reshape(real_bsz*num_classes, cur_len, vocab)[:, -1, :] # bsz, vocab
+        next_token_pragmatic_listener_probabilities = next_token_pragmatic_listener_probabilities[torch.arange(next_token_pragmatic_listener_probabilities.shape[0]), next_token_selection[input_ids.shape[0]//(self.num_classes+1):]]
+        next_token_pragmatic_listener_probabilities = next_token_pragmatic_listener_probabilities.view(real_bsz, num_classes).unsqueeze(1)
+        prior_distributions = torch.cat((prior_distributions, next_token_pragmatic_listener_probabilities), dim=1)
+        return prior_distributions
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+     # rewrite sample function from GenerationMixin
     def sample(
         self,
         input_ids: torch.LongTensor,
-        labels: torch.LongTensor,
+        #labels: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
         logits_warper: Optional[LogitsProcessorList] = None,
         max_length: Optional[int] = None,
@@ -211,6 +339,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
+        prior_distributions=None,
         **model_kwargs,
     ) -> Union[SampleOutput, torch.LongTensor]:
 
@@ -252,16 +381,18 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             # prepare model inputs
            
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
             #print(f"input_ids shape:{model_inputs['input_ids'].shape}")
         ################################################################################################
         # use pragmatic output for generation
             # forward pass to get next token
             outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
-                labels=labels,
+                #labels=labels,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                prior_distributions=prior_distributions
             )
             #next_token_logits = outputs.logits[:, -1, :]
             next_token_logits = torch.log(stepwise_outputs.pragmatic_speaker_probabilities[:, -1, :])
@@ -306,7 +437,8 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             cur_len = cur_len + 1
-            labels = torch.cat([labels, input_ids[:, -1:]], dim=-1)
+            #labels = torch.cat([labels, input_ids[:, -1:]], dim=-1)
+            prior_distributions = self.update_prior_distributions(input_ids, stepwise_outputs.pragmatic_listener_probabilities, prior_distributions)
             #print(f"labels shape: {labels.shape}")
             #################################################################################################
 
@@ -381,7 +513,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
     def greedy_search(
         self,
         input_ids: torch.LongTensor,
-        labels: torch.LongTensor,
+        #labels: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
         max_length: Optional[int] = None,
         pad_token_id: Optional[int] = None,
@@ -390,6 +522,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
+        prior_distributions=None,
         **model_kwargs,
     ) -> Union[GreedySearchOutput, torch.LongTensor]:
         
@@ -431,10 +564,11 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             # forward pass to get next token
             outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
-                labels=labels,
+                #labels=labels,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                prior_distributions=prior_distributions,
             )
             #next_token_logits = outputs.logits[:, -1, :]
             next_token_logits = torch.log(stepwise_outputs.pragmatic_speaker_probabilities[:, -1, :])
@@ -473,8 +607,8 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
 
             # add token and increase length by one
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            labels = torch.cat([labels, input_ids[:, -1:]], dim=-1)
-
+            #labels = torch.cat([labels, input_ids[:, -1:]], dim=-1)
+            prior_distributions = self.update_prior_distributions(input_ids, stepwise_outputs.pragmatic_listener_probabilities, prior_distributions)
             # update sequence length
             if eos_token_id is not None:
                 sequence_lengths, unfinished_sequences = self._update_seq_length_for_generation(
@@ -513,12 +647,13 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         else:
             return input_ids
 
+    # TODO: consider reshape of prior distributions in beam generation methods
 
     def beam_search(
         self,
         input_ids: torch.LongTensor,
         beam_scorer: BeamScorer,
-        labels: torch.LongTensor,
+        #labels: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
         max_length: Optional[int] = None,
         pad_token_id: Optional[int] = None,
@@ -527,6 +662,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
+        prior_distributions=None,
         **model_kwargs,
     ) -> Union[BeamSearchOutput, torch.LongTensor]:
         
@@ -558,7 +694,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         ########################################################################
 
         num_beams = beam_scorer.num_beams
-        labels = labels.repeat(num_beams, 1)
+        #labels = labels.repeat(num_beams, 1)
         #print(input_ids.shape)
         batch_size = input_ids.shape[0] // ((self.num_classes+1) * num_beams)
 
@@ -592,10 +728,11 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
 
             outputs, stepwise_outputs = self.pragmatic_modeling(
                 **model_inputs,
-                labels=labels,
+                #labels=labels,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                prior_distributions=prior_distributions,
             )
             #print(((stepwise_outputs.pragmatic_speaker_probabilities[:, -1, :]-F.softmax(outputs.logits[:(outputs.logits.shape[0]//(self.num_classes+1)), -1, :], dim=-1))**2).sum())
             next_token_logits = torch.log(stepwise_outputs.pragmatic_speaker_probabilities[:, -1, :])
@@ -664,7 +801,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
             
             cur_len = cur_len + 1
-            labels = torch.cat([labels, input_ids[:,labels.shape[1]:]], dim=-1)
+            #labels = torch.cat([labels, input_ids[:,labels.shape[1]:]], dim=-1)
             ########################################################################
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
@@ -730,6 +867,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
+        prior_distributions=None,
         **model_kwargs,
     ) -> Union[BeamSampleOutput, torch.LongTensor]:
 
@@ -794,6 +932,7 @@ class PragmaticGPT2LMHeadModel(GPT2LMHeadModel, GenerationMixin):
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                prior_distributions=prior_distributions,
             )
             next_token_logits = torch.log(stepwise_outputs.pragmatic_speaker_probabilities[:, -1, :])
 

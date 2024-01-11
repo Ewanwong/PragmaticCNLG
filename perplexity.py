@@ -15,7 +15,7 @@ if __name__ == '__main__':
                         help="Path to a file to which the output of the self-diagnosis experiment is written")
     parser.add_argument("--model", type=str, default='gpt2-xl',
                         help="The specific model to compute perplexity for (e.g., 'gpt2-medium')")
-    parser.add_argument("--alpha", type=float, default=1.0,
+    parser.add_argument("--alpha", type=float, default=10.0,
                         help="Value for the rational parameter")
     """
     parser.add_argument("--decay_constant", type=float, default=50,
@@ -25,7 +25,7 @@ if __name__ == '__main__':
     """
     parser.add_argument("--max_length", type=int, default=-1,
                         help="The maximum input length to be processed (-1 corresponds to the model's context window)")
-    parser.add_argument("--max_length_pattern", type=int, default=32,
+    parser.add_argument("--max_length_pattern", type=int, default=50,
                         help="The number of tokens to reserve for the self-diagnosis patterns")
     parser.add_argument("--stride", type=int, default=-1,
                         help="If set, for the first --stride tokens no loss is computed")
@@ -38,10 +38,10 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     print(f"Parameters: {args}")
-
-    tokenizer = GPT2TokenizerFast.from_pretrained(args.model)
     config = AutoConfig.from_pretrained(args.model)
-    model = PragmaticGPT2LMHeadModel(config, args.alpha, 0, len(TARGET_PREFIXES)+len(DISTRACTOR_PREFIXES))
+    tokenizer = GPT2TokenizerFast.from_pretrained(args.model)
+    
+    model = PragmaticGPT2LMHeadModel(args.model, args.alpha, 0, len(TARGET_PREFIXES)+len(DISTRACTOR_PREFIXES))
     
     device = 'cuda' if not args.no_cuda else 'cpu'
 
@@ -62,8 +62,8 @@ if __name__ == '__main__':
         trg_len = end_loc - i  # may be different from stride on last loop
         
         input_ids = encodings.input_ids[:, begin_loc:end_loc]
-        input = tokenizer.decode(input_ids)
-        
+        input = tokenizer.batch_decode(input_ids)
+        print(trg_len)
         loss_regular, loss_debiased = model.compute_perplexity(input, TARGET_PREFIXES, DISTRACTOR_PREFIXES)
         
         log_likelihood_debiased = loss_debiased * trg_len
