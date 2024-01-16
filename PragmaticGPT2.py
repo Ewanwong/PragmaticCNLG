@@ -23,7 +23,7 @@ class StepwiseOutput:
         #self.prior_probabilities_next_step = prior_probabilities_next_step  # bsz * num_class * vocab 
 
 class PragmaticGPT2LMHeadModel(GenerationMixin):
-    def __init__(self, model, alpha, epsilon, num_classes):
+    def __init__(self, model, alpha, epsilon, num_classes, prior_aggregation_method="mean"):
         self.config = AutoConfig.from_pretrained(model)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         #self.device = torch.device("cpu")
@@ -42,6 +42,8 @@ class PragmaticGPT2LMHeadModel(GenerationMixin):
         self.alpha = alpha
         self.epsilon = epsilon
         self.num_classes = num_classes
+
+        self.prior_aggregation_method = prior_aggregation_method
         print('model initialized')
         
 
@@ -142,26 +144,29 @@ class PragmaticGPT2LMHeadModel(GenerationMixin):
             # Flatten the tokens
             
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
+        
         loss_by_sequence = loss.view(lm_logits.size(0), -1) # bsz * len-1
-
+        
         real_loss_mask = (loss_by_sequence!=0.000) # where the real inputs lie, bsz * len
         real_loss_length = real_loss_mask.sum(dim=1) #bsz,
 
-        left_padded_loss_by_sequence = torch.zeros(loss_by_sequence.shape[0], loss_by_sequence.shape[1])
+        left_padded_loss_by_sequence = torch.zeros(loss_by_sequence.shape[0], loss_by_sequence.shape[1]).to(self.device)
         for i in range(left_padded_loss_by_sequence.shape[0]):
             #print(real_loss_length[i], real_loss_mask[i, :].sum())
             left_padded_loss_by_sequence[i, -real_loss_length[i]:] = loss_by_sequence[i, real_loss_mask[i, :]]
         
         left_padded_loss_by_sequence = left_padded_loss_by_sequence.cumsum(dim=1)
-        length_mask = torch.ones((loss_by_sequence.shape[0], loss_by_sequence.shape[1]))
-        for i in range(real_loss_length.shape[0]):
-            length_mask[i,-real_loss_length[i]:] = torch.tensor([j+1 for j in range(real_loss_length[i])])
-        length_mask = length_mask.to(self.device) 
-        loss_by_sequence /= length_mask
+        if self.prior_aggregation_method == "mean":
+            length_mask = torch.ones((loss_by_sequence.shape[0], loss_by_sequence.shape[1]))
+            for i in range(real_loss_length.shape[0]):
+                length_mask[i,-real_loss_length[i]:] = torch.tensor([j+1 for j in range(real_loss_length[i])])
+            
+            length_mask = length_mask.to(self.device) 
+            left_padded_loss_by_sequence /= length_mask
+        
         #print((loss_by_sequence==0.000).sum(dim=1)[0]) # real_bsz, 
         #loss_by_sequence /= torch.tensor([i+1 for i in range(loss_by_sequence.shape[1])]*loss_by_sequence.shape[0], device=loss_by_sequence.device)
-        unnormalized_listener_probability = loss_by_sequence.view(self.num_classes, real_bsz, loss_by_sequence.shape[1]).permute(1, 2, 0) # real_bsz * len-1 * num_classes
+        unnormalized_listener_probability = left_padded_loss_by_sequence.view(self.num_classes, real_bsz, loss_by_sequence.shape[1]).permute(1, 2, 0) # real_bsz * len-1 * num_classes
         
         prior_distributions = F.softmax(-unnormalized_listener_probability, dim=-1) # real_bsz * len-1 * num_classes
         prior_distributions = torch.cat(((torch.ones((real_bsz, 1, self.num_classes))/self.num_classes).to(self.device), prior_distributions), dim=1)
@@ -279,7 +284,7 @@ class PragmaticGPT2LMHeadModel(GenerationMixin):
         regular_output_logits=regular_output_logits[label_mask].unsqueeze(0)
         debiased_output_logits=debiased_output_logits[label_mask].unsqueeze(0)
         real_labels = real_labels[label_mask].unsqueeze(0)
-        print(regular_output_logits.shape, debiased_output_logits.shape, real_labels.shape)
+        #print(regular_output_logits.shape, debiased_output_logits.shape, real_labels.shape)
         loss_fct = CrossEntropyLoss()
         shift_regular_logits = regular_output_logits[..., :-1, :].contiguous()
         shift_debiased_logits = debiased_output_logits[..., :-1, :].contiguous()
