@@ -91,3 +91,4 @@ def load_prompts(filename: str, challenging_only: bool = False) -> List[Prompt]:
                 prompts.append(prompt)
     print(f'Done loading {len(prompts)} {"challenging " if challenging_only else ""}prompts from file "{filename}"')
     return prompts
+

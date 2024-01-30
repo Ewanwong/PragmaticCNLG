@@ -7,8 +7,8 @@ from typing import List, Dict
 from transformers import AutoConfig
 import torch
 from tqdm import tqdm
-from PragmaticGPT2 import PragmaticGPT2LMHeadModel
-from transformers import AutoTokenizer
+from new_PragmaticGPT2 import PragmaticGPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from perspective_api import PerspectiveApiScorer
 from io_utils import load_prompts, ModelOutput, Prompt
 
@@ -24,8 +24,32 @@ DISTRACTOR_PREFIXES = [
     "The following text contains swear words, curse words, or other obscene or profane language:"
 ]
 
+DISTRACTOR_DEMONSTRATIONS = [
+    'The following sentences contain rude, disrespectful, or unreasonable language: a hypocrite) but, in general, nobody and everybody understands what Isonales County has done\n\nThe following sentences contain rude, disrespectful, or unreasonable language: from him looking down. We set off on the following morning but after meeting Dick Glidden with a\n\nThe following sentences contain rude, disrespectful, or unreasonable language:',
+    'The following sentences contain a threat: "believes" we must end the use of live-streaming of our accounts by criminals\n\nThe following sentences contain a threat: agenda—beyond what we have done in Berlin—will be Israel\'s revenge for the massacre that\n\nThe following sentences contain a threat:',
+    'The following sentences contain sexually explicit language: female student to show up naked because she was concerned about putting her down with a stroller after his\n\nThe following sentences contain sexually explicit language: child to have sex with his face because she lied to her boyfriend.The teacher, Alexandra\n\nThe following sentences contain sexually explicit language:',
+    'The following sentences contain very hateful, aggressive, disrespectful language: curling plank in the kitchen with no heat from his hands, screaming for his beloved Labrador.\n\nThe following sentences contain very hateful, aggressive, disrespectful language: gateways.Scramble ahead. Grrrrrrrr on Saturday.\n\nThe following sentences contain very hateful, aggressive, disrespectful language:',
+    'The following sentences contain negative or hateful language targeting someone because of their identity: in our organization\'s leadership, which we believe supports Freedom and defends black families."In his\n\nThe following sentences contain negative or hateful language targeting someone because of their identity: Palestinian territory and a massive bomb attack on Israeli-leased flights, ISIS is rapidly changing how it sees\n\nThe following sentences contain negative or hateful language targeting someone because of their identity:',
+    'The following sentences contain swear words, curse words, or other obscene or profane language: killing herself for the general, as if so-called junior partners of Vladimir Putin or Steve Bannon would\n\nThe following sentences contain swear words, curse words, or other obscene or profane language: men take in an open wound from the penis when they are resting and absorb the body fluids, such\n\nThe following sentences contain swear words, curse words, or other obscene or profane language:',
+]
+
+TARGET_DEMONSTRATIONS = [
+    "The following text contains no bias, stereotypes, hateful speech or toxic content:"
+]
 
 
+def fill_in_prefix(prefixes, descriptions, attribute, n_demonstrations, toxic):
+    instructions = [prefix.replace('[BLANK]', descriptions[attribute]) for prefix in prefixes]
+    with open("toy_latest_wrong.json") as f:
+        examples = json.load(f)
+    
+    if toxic:
+        demonstrations = examples['gpt2-xl'][attribute][-n_demonstrations:]
+    else:
+        demonstrations = examples['gpt2-xl'][attribute][:n_demonstrations]
+    demonstrations = ["".join([instruction + demonstration['text']+"\n\n" for demonstration in demonstrations]) for instruction in instructions]
+   # return [prefix.replace('[BLANK]', descriptions[attribute]) for prefix in prefixes]
+    return [demonstration+instruction for demonstration, instruction in zip(demonstrations, instructions)]
 
 def get_maximum_expected_score_per_attribute(prompts: List[Prompt]) -> Dict[str, float]:
     """
@@ -61,7 +85,7 @@ def get_attribute_probabilities(prompts: List[Prompt]) -> Dict[str, float]:
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prompts_filename", type=str, required=True,
+    parser.add_argument("--prompts_filename", type=str, default='realtoxicityprompts-data/prompts.jsonl',
                         help="Path to a jsonl file containing all prompts, in the format used by RealToxicityPrompts")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Path to a directory into which generated outputs are written")
@@ -71,7 +95,7 @@ if __name__ == '__main__':
                         help="The specific models to run self-debiasing experiments for (e.g., 'gpt2-medium gpt2-large')")
     parser.add_argument("--modes", nargs='+', choices=['default', 'debiased'], default=['debiased'],
                         help="Whether to perform debiased ('debiased') or regular ('default') generation")
-    parser.add_argument("--alpha", type=float, default=1.0,
+    parser.add_argument("--alpha", type=float, default=20.0,
                         help="Value for the rational parameter")
     """
     parser.add_argument("--decay_constant", type=float, default=50,
@@ -105,10 +129,11 @@ if __name__ == '__main__':
                         help="The seed for initializing the random number generator used for sampling")
     parser.add_argument("--debug", action='store_true',
                         help="If set, additional debugging output is printed to stdout")
+    parser.add_argument("--prior_aggregation_method", type=str, default='sum', choices=['mean', 'sum'],)
 
     args = parser.parse_args()
     print(f"Parameters: {args}")
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
@@ -120,20 +145,22 @@ if __name__ == '__main__':
     if args.max_prompts > 0:
         prompts = prompts[:args.max_prompts]
 
+
     for model_idx, model_name in enumerate(args.models):
-        
-        model = PragmaticGPT2LMHeadModel(model_name ,args.alpha, 0, len(TARGET_PREFIXES)+len(DISTRACTOR_PREFIXES))
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.padding_side = 'left'
+        tokenizer.pad_token = tokenizer.eos_token
+        default_model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        if "debiased" in args.modes:
+            model = PragmaticGPT2LMHeadModel(model_name ,args.alpha, 0, len(TARGET_PREFIXES)+len(DISTRACTOR_PREFIXES), args.prior_aggregation_method).to(device)
 
         errors = 0
         for mode in args.modes:
             
-            if mode == "default":
-                tokenizer = AutoTokenizer.from_pretrained(model_name)
-                tokenizer.padding_side = 'left'
-                tokenizer.pad_token = tokenizer.eos_token
+
             print(f'Generating continuations for {len(prompts)} prompts with model {model_name} ({mode})')
             prompt_iterator = tqdm(prompts, desc="Prompts")
-            
+            error = 0
             for prompt in prompt_iterator:
                 output_texts = []
                 for _ in range(args.num_repeats):
@@ -142,21 +169,22 @@ if __name__ == '__main__':
                             output_texts += model.debiased_generation([prompt.text],target_prompts=TARGET_PREFIXES, distractor_prompts=DISTRACTOR_PREFIXES, min_length=args.min_length, max_length=args.max_length, do_sample=args.do_sample,
                                 num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)
                         except RuntimeError:
-                            inputs = model.tokenizer_left([prompt.text], padding=True, truncation=True, return_tensors='pt')
+                            error += 1
+                            inputs = tokenizer([prompt.text], padding=True, truncation=True, return_tensors='pt')
                             inputs = {k:v.to(model.device) for k,v in inputs.items()}
                             min_length = inputs['input_ids'].shape[1] + args.min_length
                             max_length = inputs['input_ids'].shape[1] + args.max_length
-                            output_texts += model.tokenizer_left.batch_decode(model.model.generate(**inputs, min_length=min_length, max_length=max_length, do_sample=args.do_sample,
-                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-                            print("new error")
+                            output_texts += tokenizer.batch_decode(default_model.generate(**inputs, min_length=min_length, max_length=max_length, do_sample=args.do_sample,
+                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences, pad_token_id=tokenizer.eos_token_id)[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+                            print(f"error {error}")
                     elif mode == 'default':
                         
                         inputs = tokenizer([prompt.text], padding=True, truncation=True, return_tensors='pt')
                         inputs = {k:v.to(model.device) for k,v in inputs.items()}
                         min_length = inputs['input_ids'].shape[1] + args.min_length
                         max_length = inputs['input_ids'].shape[1] + args.max_length
-                        output_texts += tokenizer.batch_decode(model.model.generate(**inputs, min_length=min_length, max_length=max_length, do_sample=args.do_sample,
-                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences)[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+                        output_texts += tokenizer.batch_decode(default_model.generate(**inputs, min_length=min_length, max_length=max_length, do_sample=args.do_sample,
+                            num_beams=args.num_beams, top_k=args.top_k, num_return_sequences=args.num_return_sequences, pad_token_id=tokenizer.eos_token_id)[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
 
                 # clear prompt continuations from previous iterations
                 prompt.continuations.clear()
@@ -165,7 +193,7 @@ if __name__ == '__main__':
                     scores = scorer.get_scores(output_text)
                     generated_example = ModelOutput(text=output_text, scores=scores)
                     prompt.continuations.append(generated_example)
-                   
+            errors += error     
             maximum_expected_scores = get_maximum_expected_score_per_attribute(prompts)
             attribute_probabilities = get_attribute_probabilities(prompts)
 
@@ -177,6 +205,7 @@ if __name__ == '__main__':
                 fh.write(f'=== RESULT [{model_name}, {mode}] ===\n')
                 fh.write(f'{maximum_expected_scores}\n')
                 fh.write(f'{attribute_probabilities}\n')
+                fh.write(f'Errors: {error} times\n')
 
             output_path = os.path.join(args.output_dir, f'prompted_generations_{model_name}_{mode}.txt')
             with open(output_path, 'w', encoding='utf8') as fh:
